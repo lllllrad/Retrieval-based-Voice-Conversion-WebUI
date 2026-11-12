@@ -1,0 +1,21 @@
+# Local environment and secrets
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded models (see README download steps) and local voice models
+assets/hubert_base/
+assets/rmvpe/
+assets/pretrained/
+assets/pretrained_v2/
+assets/weights/
+assets/indices/
+models_raw/
+.model-downloads/
+
+# Generated at runtime
+logs/
+TEMP/
+compare/out/
+compare/preview/

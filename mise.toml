@@ -1,0 +1,18 @@
+[tools]
+ffmpeg = "latest"
+just = "latest"
+python = "3.12"
+uv = "latest"
+
+[settings]
+python.uv_venv_auto = "create|source"
+
+[tasks.webui]
+description = "Start RVC WebUI on port 7865"
+run = "python webui.py --noautoopen"
+# UI language: ko_KR or en_US (override with `RVC_LANGUAGE=en_US mise run webui`)
+env = { RVC_LANGUAGE = "{{ get_env(name='RVC_LANGUAGE', default='ko_KR') }}" }
+
+[tasks.live]
+description = "Start live (WebSocket) voice conversion server on port 7867"
+run = "python -m tools.live.server --port 7867"
