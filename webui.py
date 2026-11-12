@@ -44,6 +44,9 @@ for name in os.listdir(tmp):
 from configs.config import Config, GPU_INDEX, GPU_INFOS, GPU_MEMORY, IS_GPU
 from infer.vc.modules import VC
 from infer.vc.utils import get_index_path_from_model
+from tools.blend_tab import build_blend_tab
+from tools.manage_tab import build_manage_tab
+from tools.compare_tab import build_compare_tab
 from tools.pymss_webui import (
     PYMSS_MODEL_CHOICES,
     get_model_info,
@@ -88,6 +91,25 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+class _ReuseAddrSocketModule:
+    """socket module stand-in for Gradio's pre-launch port probe, which
+    otherwise rejects a port that only has TIME_WAIT connections."""
+
+    def __getattr__(self, name):
+        return getattr(socket, name)
+
+    @staticmethod
+    def socket(*args, **kwargs):
+        sock = socket.socket(*args, **kwargs)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return sock
+
+
+import gradio.networking as _gradio_networking  # noqa: E402
+
+_gradio_networking.socket = _ReuseAddrSocketModule()
+
+
 def find_available_port(start_port, host="0.0.0.0"):
     """Return the first bindable TCP port at or above ``start_port``."""
     if not 1 <= start_port <= 65535:
@@ -96,6 +118,9 @@ def find_available_port(start_port, host="0.0.0.0"):
     for port in range(start_port, 65536):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                # Same rule as uvicorn's real bind: ignore TIME_WAIT leftovers
+                # from a just-stopped server, fail only on a live listener.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind((host, port))
             return port
         except OSError:
@@ -490,7 +515,7 @@ def button_update(value=None, variant=None, visible=None):
     return update
 
 
-def render_pymss_progress(percent=0, label="等待开始", state="idle"):
+def render_pymss_progress(percent=0, label=i18n("等待开始"), state="idle"):
     percent = max(0.0, min(100.0, float(percent or 0)))
     colors = {
         "idle": "#64748b",
@@ -526,7 +551,7 @@ def run_pymss_separation(
 ):
     progress_state = {
         "percent": 0.0,
-        "label": "正在准备 PyMSS 分离任务",
+        "label": i18n("正在准备 PyMSS 分离任务"),
         "state": "running",
     }
     busy = False
@@ -545,10 +570,10 @@ def run_pymss_separation(
             progress_state["percent"] = (
                 (file_index - 1 + file_fraction) / file_count * 100
             )
-            progress_state["label"] = "文件 %s/%s · %s · %.0f/%.0f 秒" % (
+            progress_state["label"] = i18n("文件 %s/%s · %s · %.0f/%.0f 秒") % (
                 file_index,
                 file_count,
-                message or "正在处理音频",
+                message or i18n("正在处理音频"),
                 done,
                 total,
             )
@@ -560,14 +585,14 @@ def run_pymss_separation(
         elif event_type == "file":
             progress_state["percent"] = file_index / file_count * 100
             progress_state["label"] = (
-                message.splitlines()[0] if message else "文件处理结束"
+                message.splitlines()[0] if message else i18n("文件处理结束")
             )
             progress_state["state"] = "running" if event.get("ok") else "failed"
         elif event_type == "done":
             successful = int(event.get("successful") or 0)
             failed = int(event.get("failed") or 0)
             progress_state["percent"] = 100.0
-            progress_state["label"] = "分离完成：成功 %s，失败 %s" % (
+            progress_state["label"] = i18n("分离完成：成功 %s，失败 %s") % (
                 successful,
                 failed,
             )
@@ -577,11 +602,11 @@ def run_pymss_separation(
             progress_state["label"] = message
             progress_state["state"] = "running"
         elif event_type == "cancelled":
-            progress_state["label"] = message or "PyMSS 分离任务已停止"
+            progress_state["label"] = message or i18n("PyMSS 分离任务已停止")
             progress_state["state"] = "stopped"
         elif event_type in {"fatal", "busy"}:
             progress_state["label"] = (
-                message.splitlines()[0] if message else "PyMSS 分离任务失败"
+                message.splitlines()[0] if message else i18n("PyMSS 分离任务失败")
             )
             progress_state["state"] = "failed"
             busy = event_type == "busy"
@@ -613,9 +638,9 @@ def run_pymss_separation(
                 stop_button,
             )
     except Exception:
-        last_info = "失败\n%s" % traceback.format_exc()
+        last_info = i18n("失败\n%s") % traceback.format_exc()
         progress_state.update(
-            {"label": "PyMSS 分离任务失败", "state": "failed"}
+            {"label": i18n("PyMSS 分离任务失败"), "state": "failed"}
         )
         logger.exception("PyMSS WebUI task failed")
 
@@ -630,7 +655,7 @@ def run_pymss_separation(
 def stop_pymss_webui():
     return (
         _stop_pymss_separation_core(),
-        render_pymss_progress(0, "PyMSS 分离任务已停止", "stopped"),
+        render_pymss_progress(0, i18n("PyMSS 分离任务已停止"), "stopped"),
         button_update(visible=True),
         button_update(visible=False),
     )
@@ -2102,6 +2127,10 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                     queue=False,
                     api_name="infer_change_speaker_index_dropdown",
                 )
+        build_compare_tab(config)
+        build_blend_tab(config)
+        build_manage_tab()
+
         with gr.TabItem(i18n("人声伴奏分离&去混响")):
             with gr.Group():
                 gr.Markdown(
@@ -2155,7 +2184,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                             i18n("停止分离"), variant="stop", visible=False
                         )
                     pymss_progress = gr.HTML(
-                        value=render_pymss_progress(0, "等待开始", "idle")
+                        value=render_pymss_progress(0, i18n("等待开始"), "idle")
                     )
                     vc_output4 = gr.Textbox(label=i18n("输出信息"))
                     but2.click(
