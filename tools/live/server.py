@@ -103,6 +103,14 @@ class Engine:
     def is_half(self):
         return self.config.is_half
 
+    def separators(self):
+        """Shared accompaniment/reverb removal models (loaded on first use)."""
+        if getattr(self, "_separators", None) is None:
+            from tools.live.preproc import Separators
+
+            self._separators = Separators(self.device)
+        return self._separators
+
     # ---- model data -------------------------------------------------
     def _load(self, name):
         if name in self.raw:
@@ -237,16 +245,18 @@ class Engine:
 class Session:
     """Per-connection buffers; mirrors realtime_gui.GUI.start_vc/audio_callback."""
 
-    def __init__(self, engine, sr, block_time=0.25, extra_time=2.0,
-                 crossfade_time=0.05, threshold=-60.0, f0method="rmvpe"):
+    def __init__(self, engine, sr, block_time=0.25, extra_time=2.0, crossfade_time=0.05):
         self.engine = engine
         self.dev = engine.device
         self.sr = int(sr)
         self.zc = self.sr // 100
-        self.threshold = float(threshold)
-        self.f0method = f0method
+        # User settings: change them only through apply() (see there).
+        self.threshold = -60.0
+        self.f0method = "rmvpe"
         self.rms_mix = 0.0
         self.bypass = False
+        self.cleaner = None       # StreamCleaner (accompaniment/reverb removal), created on demand
+        self.last_input = None    # block after cleaning; what the transcript compares against
         zc = self.zc
         self.block_frame = int(round(block_time * self.sr / zc)) * zc
         self.block_frame_16k = 160 * self.block_frame // zc
@@ -280,11 +290,73 @@ class Session:
             self.resampler2_sr = tgt_sr
         return self.resampler2
 
+    # ---- settings ---------------------------------------------------
+    # Every user setting of a session goes through apply() and is reported by
+    # state(). The connection keeps the settings it was sent and re-applies all
+    # of them to each new Session, and the client compares state() (sent with
+    # every block's stats) to its own controls and re-sends what differs. So a
+    # setting cannot silently drop when a session is rebuilt or a message is
+    # lost; a new setting only needs a branch here and an entry in state().
+    def apply(self, settings):
+        """Apply any subset of the settings. "clean" goes last because it can
+        fail (missing weights) or take a while (model load)."""
+        if "threshold" in settings:
+            self.threshold = float(settings["threshold"])
+        if "rmsMix" in settings:
+            self.rms_mix = float(settings["rmsMix"])
+        if "bypass" in settings:
+            self.bypass = bool(settings["bypass"])
+        if "f0method" in settings:
+            self.f0method = str(settings["f0method"])
+        if "clean" in settings:
+            self.set_clean(list(settings["clean"]))
+
+    def state(self):
+        return {
+            "threshold": self.threshold,
+            "rmsMix": self.rms_mix,
+            "bypass": self.bypass,
+            "f0method": self.f0method,
+            "clean": self.clean_kinds(),
+            "clean_delay_ms": self.cleaner.delay_ms if self.cleaner else 0,
+        }
+
+    def clean_kinds(self):
+        from tools.live.preproc import ORDER
+
+        enabled = self.cleaner.enabled if self.cleaner else ()
+        return [k for k in ORDER if k in enabled]
+
+    def set_clean(self, kinds):
+        """Enable/disable input cleaning ("vocals" = remove accompaniment,
+        "dereverb" = remove reverb).
+        Loads the models here (slow the first time), not in process()."""
+        from tools.live.preproc import SPECS, StreamCleaner, missing_weights
+
+        kinds = [k for k in kinds if k in SPECS]
+        missing = [k for k in kinds if k in missing_weights()]
+        if missing:
+            raise ValueError("separation weights missing in assets/pymss_weights: %s" % ", ".join(missing))
+        if kinds and self.cleaner is None:
+            # A longer window separates better but costs more per block.
+            window = 2.0 if self.block_frame / self.sr >= 0.3 else 1.0
+            self.cleaner = StreamCleaner(self.engine.separators(), self.sr, self.block_frame, window=window)
+        for k in kinds:
+            self.engine.separators().get(k)
+        if self.cleaner is not None:
+            self.cleaner.set_enabled(set(kinds))
+
     def process(self, indata):
         import librosa
 
         zc = self.zc
         indata = indata.astype(np.float32)
+        t_clean = 0.0
+        if self.cleaner is not None and self.cleaner.enabled:
+            t0 = time.perf_counter()
+            indata = self.cleaner.process(indata)
+            t_clean = time.perf_counter() - t0
+        self.last_input = indata
         if self.threshold > -60:
             x = np.append(self.rms_buffer, indata)
             rms = librosa.feature.rms(y=x, frame_length=4 * zc, hop_length=zc)[:, 2:]
@@ -295,8 +367,9 @@ class Session:
                 if quiet[i]:
                     x[i * zc:(i + 1) * zc] = 0
             indata = x[zc // 2:]
+        clean_stats = {"clean_ms": round(t_clean * 1000, 1)} if t_clean else {}
         if self.bypass:
-            return indata[: self.block_frame].copy(), {}
+            return indata[: self.block_frame].copy(), clean_stats
         bf = self.block_frame
         self.input_wav[:-bf] = self.input_wav[bf:].clone()
         self.input_wav[-indata.shape[0]:] = torch.from_numpy(indata).to(self.dev)
@@ -350,7 +423,7 @@ class Session:
         infer_wav[:sb] += self.sola_buffer * self.fade_out
         self.sola_buffer[:] = infer_wav[bf: bf + sb]
         out = infer_wav[:bf].cpu().numpy()
-        return out, {"infer_ms": round(t_infer * 1000, 1)}
+        return out, {"infer_ms": round(t_infer * 1000, 1), **clean_stats}
 
 
 # ---------------------------------------------------------------- app
@@ -426,6 +499,7 @@ async def ws_endpoint(ws: WebSocket):
     session = None
     stt = None
     stt_cfg = {}
+    settings = {}  # every session setting this client sent; re-applied to each new Session
     pending = np.zeros(0, dtype=np.float32)
     dropped = 0
     send_lock = asyncio.Lock()
@@ -433,6 +507,25 @@ async def ws_endpoint(ws: WebSocket):
     async def send_json(obj):
         async with send_lock:
             await ws.send_text(json.dumps(obj, ensure_ascii=False))
+
+    async def apply_settings(changes):
+        """Apply settings to the session and always answer with one "state"
+        message (the client counts them to know when it is in sync)."""
+        try:
+            settings.update(changes)
+            if changes.get("clean") and changes["clean"] != session.clean_kinds():
+                await send_json({"type": "clean_loading"})
+            try:
+                await loop.run_in_executor(None, session.apply, changes)
+            except Exception as error:
+                logger.warning("applying settings failed\n%s", traceback.format_exc())
+                # Keep only what actually took effect so the next session matches.
+                if "clean" in changes:
+                    settings["clean"] = session.clean_kinds()
+                await send_json({"type": "error", "scope": "clean" if "clean" in changes else "params",
+                                 "message": str(error)})
+        finally:
+            await send_json({"type": "state", **session.state()})
 
     async def send_json_quiet(obj):
         try:
@@ -454,8 +547,6 @@ async def ws_endpoint(ws: WebSocket):
                             engine, data["sampleRate"],
                             block_time=float(data.get("blockTime", 0.25)),
                             extra_time=float(data.get("extraTime", 2.0)),
-                            threshold=float(data.get("threshold", -60)),
-                            f0method=data.get("f0method", "rmvpe"),
                         )
                         pending = np.zeros(0, dtype=np.float32)
                         if stt is not None:
@@ -464,6 +555,7 @@ async def ws_endpoint(ws: WebSocket):
                         stt.configure(stt_cfg)
                         await send_json({"type": "started", "blockFrames": session.block_frame,
                                          "sampleRate": session.sr})
+                        await apply_settings({**settings, **(data.get("settings") or {})})
                     elif kind == "mix":
                         info = await loop.run_in_executor(
                             None, engine.set_mix, data["models"], data["weights"],
@@ -474,17 +566,15 @@ async def ws_endpoint(ws: WebSocket):
                         stt_cfg.update({k: v for k, v in data.items() if k not in ("type", "reset", "flush")})
                         if stt is not None:
                             stt.configure(data)
-                    elif kind == "params" and session is not None:
-                        if "pitch" in data:
-                            engine.set_pitch(data["pitch"])
-                        if "threshold" in data:
-                            session.threshold = float(data["threshold"])
-                        if "rmsMix" in data:
-                            session.rms_mix = float(data["rmsMix"])
-                        if "bypass" in data:
-                            session.bypass = bool(data["bypass"])
-                        if "f0method" in data:
-                            session.f0method = data["f0method"]
+                    elif kind == "pitch":
+                        # Pitch belongs to the shared engine (like the mix), not the session.
+                        engine.set_pitch(data["pitch"])
+                    elif kind == "params":
+                        changes = {k: v for k, v in data.items() if k != "type"}
+                        if session is None:
+                            settings.update(changes)  # applied when the session starts
+                        else:
+                            await apply_settings(changes)
                 except Exception as error:
                     logger.warning("control message failed\n%s", traceback.format_exc())
                     await send_json({"type": "error", "message": str(error)})
@@ -507,7 +597,8 @@ async def ws_endpoint(ws: WebSocket):
                 t0 = time.perf_counter()
                 out, stats = await loop.run_in_executor(executor, session.process, block)
                 if stt is not None:
-                    stt.feed(block, out, session.bypass)
+                    stt.feed(session.last_input if session.last_input is not None else block,
+                             out, session.bypass)
                 pcm = (np.clip(out, -1, 1) * 32767).astype(np.int16).tobytes()
                 async with send_lock:
                     await ws.send_bytes(pcm)
@@ -518,6 +609,7 @@ async def ws_endpoint(ws: WebSocket):
                     "backlog_ms": round(1000 * len(pending) / session.sr),
                     "dropped": dropped,
                     **stats,
+                    "state": session.state(),
                     **({"stt_buf": round(stt.seg.buffered, 1)} if stt is not None and stt.enabled else {}),
                 })
     except WebSocketDisconnect:

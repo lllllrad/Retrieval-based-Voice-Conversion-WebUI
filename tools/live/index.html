@@ -122,6 +122,9 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
       <div class="row">
         <button id="start" class="primary">시작</button>
         <label><input type="checkbox" id="bypass"> 원음 듣기</label>
+        <label title="마이크 입력에서 음악·반주를 걷어내고 목소리만 변환합니다"><input type="checkbox" id="cleanVocals"> 반주 제거</label>
+        <label title="방 울림·잔향을 걷어내고 마른 목소리만 변환합니다"><input type="checkbox" id="cleanReverb"> 잔향 제거</label>
+        <span class="note" id="cleanInfo"></span>
       </div>
       <div class="row"><span style="width:3em">입력</span><div class="meter"><div id="mIn"></div></div></div>
       <div class="row"><span style="width:3em">출력</span><div class="meter"><div id="mOut"></div></div></div>
@@ -333,7 +336,42 @@ function sendMix() {
                            indexRate: +$("indexRate").value }));
 }
 
-function sendParams(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "params", ...obj })); }
+// ---------- session settings ----------
+// One table of every per-session setting, each read straight from its control.
+// The whole set goes out with "start", each change is sent as it happens, and
+// the server reports its effective state with every block; reconcile() re-sends
+// whatever differs. So a setting can't silently drop (new session, lost or
+// failed message). A new setting needs an entry here and in Session.apply/state.
+const CLEAN_BOXES = [["cleanVocals", "vocals"], ["cleanReverb", "dereverb"]];
+const CLEAN_LABEL = { vocals: "반주", dereverb: "잔향" };
+const cleanKinds = () => CLEAN_BOXES.filter(([id]) => $(id).checked).map(([, k]) => k);
+const SETTINGS = {
+  threshold: { ids: ["threshold"], read: () => +$("threshold").value },
+  rmsMix:    { ids: ["rmsMix"],    read: () => +$("rmsMix").value },
+  bypass:    { ids: ["bypass"],    read: () => $("bypass").checked },
+  f0method:  { ids: ["f0"],        read: () => $("f0").value },
+  clean:     { ids: CLEAN_BOXES.map(([id]) => id), read: cleanKinds },
+};
+const desiredSettings = () => Object.fromEntries(Object.entries(SETTINGS).map(([k, s]) => [k, s.read()]));
+let inflight = 0;  // settings messages the server hasn't answered with "state" yet
+function sendParams(obj) {
+  if (!ws || ws.readyState !== 1) return;  // sent in full on the next start
+  inflight++;
+  ws.send(JSON.stringify({ type: "params", ...obj }));
+}
+function reconcile(state) {
+  if (inflight || !state) return;
+  const want = desiredSettings(), diff = {};
+  for (const k in want) if (JSON.stringify(want[k]) !== JSON.stringify(state[k])) diff[k] = want[k];
+  if (Object.keys(diff).length) { console.warn("live settings out of sync, re-sending", diff, state); sendParams(diff); }
+}
+let cleanDelay = 0, cleanError = "";
+function showState(st) {
+  cleanDelay = st.clean_delay_ms || 0;
+  $("cleanInfo").textContent = st.clean.length
+    ? `${st.clean.map((k) => CLEAN_LABEL[k] || k).join("·")} 제거 중 · 추가 지연 ${cleanDelay}ms`
+    : cleanError && "반주·잔향 제거를 쓸 수 없습니다: " + cleanError;
+}
 
 // ---------- audio ----------
 const WORKLETS = `
@@ -407,9 +445,9 @@ async function start() {
     };
     playNode.port.onmessage = (e) => { playFill = e.data; };
     ws.onopen = () => {
+      inflight = 1;  // "start" is answered with a "state" too
       ws.send(JSON.stringify({ type: "start", sampleRate, blockTime: +$("block").value,
-        extraTime: +$("extra").value, threshold: +$("threshold").value, f0method: $("f0").value }));
-      sendParams({ rmsMix: +$("rmsMix").value, bypass: $("bypass").checked });
+        extraTime: +$("extra").value, settings: desiredSettings() }));
       sendStt();
       sendMix();
     };
@@ -429,9 +467,18 @@ async function start() {
         $("mixinfo").textContent = `적용됨: ${names.join(" · ")} — ${d.version} · ${d.tgt_sr / 1000}k` +
           (d.index_models.length ? ` · 인덱스 ${d.index_models.length}개 반영` : " · 인덱스 없음");
       }
-      else if (d.type === "stats") { lastStats = d; showStats(); }
+      else if (d.type === "stats") { lastStats = d; showStats(); reconcile(d.state); }
+      else if (d.type === "state") { inflight = Math.max(0, inflight - 1); showState(d); }
+      else if (d.type === "clean_loading") { $("cleanInfo").textContent = "분리 모델 불러오는 중…"; }
       else if (d.type === "stt") { onStt(d); }
-      else if (d.type === "error") { $("mixinfo").textContent = "오류: " + d.message; }
+      else if (d.type === "error") {
+        if (d.scope === "clean") {
+          // Uncheck so reconcile() doesn't keep retrying; the "state" reply follows.
+          for (const [id] of CLEAN_BOXES) $(id).checked = false;
+          cleanError = d.message;
+        }
+        else $("mixinfo").textContent = "오류: " + d.message;
+      }
     };
     ws.onclose = () => { if (running) stop("연결 끊김", "err"); };
     ws.onerror = () => setStatus("연결 오류", "err");
@@ -459,7 +506,7 @@ function showStats() {
   $("sBuf").textContent = bufMs;
   $("sDrop").textContent = s.dropped;
   $("sttBuf").textContent = s.stt_buf == null ? "–" : s.stt_buf.toFixed(1);
-  $("sLat").textContent = Math.round(s.block_ms + s.proc_ms + bufMs + outLat);
+  $("sLat").textContent = Math.round(s.block_ms + s.proc_ms + bufMs + outLat + cleanDelay);
   $("slow").hidden = !(s.proc_ms > s.block_ms * 0.9);
 }
 
@@ -473,15 +520,17 @@ $("even").onclick = () => {
   renderWeights(); onMixChange();
 };
 $("clearSel").onclick = () => { selected.clear(); renderPicks(); renderWeights(); onMixChange(); };
-$("bypass").onchange = () => sendParams({ bypass: $("bypass").checked });
-$("f0").onchange = () => sendParams({ f0method: $("f0").value });
+for (const [key, s] of Object.entries(SETTINGS))
+  for (const id of s.ids)
+    $(id).addEventListener($(id).type === "range" ? "input" : "change", () => {
+      if (key === "clean") cleanError = "";
+      sendParams({ [key]: s.read() });
+    });
 for (const id of ["pitch", "indexRate", "rmsMix", "threshold", "buffer"]) {
   $(id).addEventListener("input", () => {
     $(id + "V").textContent = $(id).value;
-    if (id === "pitch") sendParams({ pitch: +$("pitch").value });
+    if (id === "pitch" && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "pitch", pitch: +$("pitch").value }));
     if (id === "indexRate") onMixChange();
-    if (id === "rmsMix") sendParams({ rmsMix: +$("rmsMix").value });
-    if (id === "threshold") sendParams({ threshold: +$("threshold").value });
     if (id === "buffer") playerCfg();
   });
 }

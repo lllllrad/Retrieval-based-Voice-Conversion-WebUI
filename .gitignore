@@ -19,3 +19,4 @@ logs/
 TEMP/
 compare/out/
 compare/preview/
+assets/pymss_weights/*.ckpt
